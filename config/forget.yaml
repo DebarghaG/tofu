@@ -11,7 +11,7 @@ data_path: locuslab/TOFU
 batch_size: 4
 gradient_accumulation_steps: 4
 num_epochs: 10
-forget_loss: grad_ascent
+forget_loss: enhanced_grad_diff
 save_dir: ${model_path}/1GPU_${forget_loss}_${lr}_${split}
 overwrite_dir: false
 weight_decay: 0.01

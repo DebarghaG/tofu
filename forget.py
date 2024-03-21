@@ -116,7 +116,7 @@ def main(cfg):
     if path_found:
         print("Loading from checkpoint")
         model = AutoModelForCausalLM.from_pretrained(cfg.model_path, use_flash_attention_2=model_cfg["flash_attention2"]=="true", torch_dtype=torch.bfloat16, trust_remote_code = True)
-        if cfg.forget_loss == "KL":
+        if cfg.forget_loss == "KL" or cfg.forget_loss == "Wasserstein" or cfg.forget_loss == "JSD" or cfg.forget_loss=="hybrid":
             oracle_model = AutoModelForCausalLM.from_pretrained(cfg.model_path, use_flash_attention_2=model_cfg["flash_attention2"]=="true", torch_dtype=torch.bfloat16, trust_remote_code = True)
 
     else:

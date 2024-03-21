@@ -48,7 +48,7 @@ class CustomTrainerForgetting(Trainer):
         self.eval_cfg = kwargs.pop('eval_cfg')
 
         super(CustomTrainerForgetting, self).__init__(*args, **kwargs)
-        if self.loss_type == "KL":
+        if self.loss_type == "KL" or self.loss_type == "Wasserstein" or self.loss_type == "JSD"  or self.loss_type == "hybrid":
             self.oracle_model = self.e_prepare_deepspeed(self.oracle_model)
 
     def e_prepare_deepspeed(self, model):
@@ -109,6 +109,38 @@ class CustomTrainerForgetting(Trainer):
             retain_loss = retain_outputs.loss
             loss = forget_loss + retain_loss
         
+        elif self.loss_type == "enhanced_grad_diff":
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
+            outputs = model(input_ids, labels=labels, attention_mask=attention_mask)
+            forget_loss = outputs.loss
+            forget_loss = forget_loss * -1
+
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            retain_outputs = model(retain_input_ids, labels=retain_labels, attention_mask=retain_attention_mask)
+            retain_loss = retain_outputs.loss
+
+            # Compute the model's confidence scores for forget and retain examples
+            forget_confidence = torch.softmax(outputs.logits, dim=-1).max(dim=-1)[0]
+            retain_confidence = torch.softmax(retain_outputs.logits, dim=-1).max(dim=-1)[0]
+
+            # Compute the gradient magnitudes for forget and retain examples
+            forget_grad_mag = torch.norm(torch.autograd.grad(forget_loss, model.parameters(), retain_graph=True)[0], p=2)
+            retain_grad_mag = torch.norm(torch.autograd.grad(retain_loss, model.parameters(), retain_graph=True)[0], p=2)
+
+            # Weight the loss by the confidence scores and gradient magnitudes
+            forget_weight = forget_confidence * forget_grad_mag
+            retain_weight = retain_confidence * retain_grad_mag
+
+            # Normalize the weights
+            total_weight = forget_weight + retain_weight
+            forget_weight = forget_weight / total_weight
+            retain_weight = retain_weight / total_weight
+
+            # Compute the weighted loss
+            loss = forget_weight * forget_loss + retain_weight * retain_loss
+
+            
         elif self.loss_type == "KL":
             forget_inputs, retain_inputs = inputs
             input_ids, labels, attention_mask = forget_inputs
@@ -129,6 +161,115 @@ class CustomTrainerForgetting(Trainer):
             #minimum KL divergence
             retain_loss = nn.functional.kl_div(current_probs, retain_probs, reduction='batchmean', log_target=True)
             loss = forget_loss + retain_loss
+
+        elif self.loss_type == "Wasserstein":
+
+            def approximate_wasserstein_distance(p, q):
+                """
+                Approximate the Wasserstein distance between two distributions.
+                
+                Args:
+                - p (Tensor): The first probability distribution (flattened).
+                - q (Tensor): The second probability distribution (flattened).
+                
+                Returns:
+                - Tensor: The approximated Wasserstein distance.
+                """
+                # Ensure the distributions sum to 1
+                p = p / p.sum()
+                q = q / q.sum()
+                
+                # Sort the distributions
+                p_sorted, _ = torch.sort(p)
+                q_sorted, _ = torch.sort(q)
+                
+                # Calculate the cumulative distributions
+                p_cumulative = torch.cumsum(p_sorted, dim=0)
+                q_cumulative = torch.cumsum(q_sorted, dim=0)
+                
+                # Calculate the Earth Mover's Distance (EMD) as the Wasserstein distance
+                wasserstein_distance = torch.sum(torch.abs(p_cumulative - q_cumulative))
+                
+                return wasserstein_distance
+            
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
+            outputs = model(input_ids, labels=labels, attention_mask=attention_mask)
+            forget_loss = outputs.loss
+            forget_loss = forget_loss * -1
+
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            with torch.no_grad():
+                retain_outputs = self.oracle_model(retain_input_ids, labels=retain_labels, attention_mask=retain_attention_mask)
+
+            # Compute the softmax probabilities for the model's output and the oracle model's output
+            current_probs = F.softmax(outputs.logits, dim=-1)
+            retain_probs = F.softmax(retain_outputs.logits, dim=-1)
+
+            # Flatten the probability distributions
+            current_probs = current_probs.view(-1)
+            retain_probs = retain_probs.view(-1)
+
+            # Compute the Wasserstein distance
+            retain_loss = approximate_wasserstein_distance(current_probs, retain_probs)
+
+            loss = forget_loss + retain_loss
+
+
+        elif self.loss_type == "JSD":
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
+            
+            outputs = model(input_ids, labels=labels, attention_mask=attention_mask)
+            forget_loss = outputs.loss
+            forget_loss = forget_loss * -1
+            
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            
+            with torch.no_grad():
+                retain_outputs = self.oracle_model(retain_input_ids, labels=retain_labels, attention_mask=retain_attention_mask)
+                retain_probs = F.softmax(retain_outputs.logits, dim=-1)
+                retain_probs = retain_probs.view(-1, retain_outputs.logits.shape[-1])
+            
+            current_outputs = model(retain_input_ids, labels=retain_labels, attention_mask=retain_attention_mask)
+            current_probs = F.softmax(current_outputs.logits, dim=-1)
+            current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
+            
+            # Jensen-Shannon Divergence
+            m = 0.5 * (current_probs + retain_probs)
+            retain_loss = 0.5 * (nn.functional.kl_div(current_probs, m, reduction='batchmean') +
+                                nn.functional.kl_div(retain_probs, m, reduction='batchmean'))
+            
+            loss = forget_loss + retain_loss
+
+
+        elif self.loss_type == "hybrid":
+            forget_inputs, retain_inputs = inputs
+            input_ids, labels, attention_mask = forget_inputs
+            outputs = model(input_ids, labels=labels, attention_mask=attention_mask)
+            forget_loss = outputs.loss
+            forget_loss = forget_loss * -1
+
+            retain_input_ids, retain_labels, retain_attention_mask = retain_inputs
+            retain_outputs = model(retain_input_ids, labels=retain_labels, attention_mask=retain_attention_mask)
+            retain_loss = retain_outputs.loss
+
+            # Compute KL divergence between the model's output and the oracle model's output
+            with torch.no_grad():
+                oracle_outputs = self.oracle_model(retain_input_ids, labels=retain_labels, attention_mask=retain_attention_mask)
+
+            model_probs = F.log_softmax(retain_outputs.logits, dim=-1)
+            model_probs = model_probs.view(-1, retain_outputs.logits.shape[-1])
+
+            oracle_probs = F.log_softmax(oracle_outputs.logits, dim=-1)
+            oracle_probs = oracle_probs.view(-1, oracle_outputs.logits.shape[-1])
+
+            kl_loss = nn.functional.kl_div(model_probs, oracle_probs, reduction='batchmean', log_target=True)
+
+            # Combine the grad_diff loss and KL loss
+            alpha = 0.5  # Adjust the weight of each loss component
+            loss = alpha * (forget_loss + retain_loss) + (1 - alpha) * kl_loss
+
 
         elif self.loss_type == "idk":
             idk_inputs, retain_inputs = inputs
@@ -173,8 +314,44 @@ class CustomTrainerForgetting(Trainer):
             loss = -idk_loss_current.mean()
 
             outputs = forget_outputs
+            
+        # Modified DPO with confidence weights
+        #     idk_inputs, forget_inputs, retain_inputs = inputs
+        #     idk_input_ids, idk_labels, idk_attention_mask = idk_inputs
+        #     forget_input_ids, forget_labels, forget_attention_mask = forget_inputs
+
+        #     idk_outputs = model(idk_input_ids, labels=idk_labels, attention_mask=idk_attention_mask)
+        #     forget_outputs = model(forget_input_ids, labels=forget_labels, attention_mask=forget_attention_mask)
+
+        #     with torch.no_grad():
+        #         idk_outputs_oracle = self.oracle_model(idk_input_ids, labels=idk_labels, attention_mask=idk_attention_mask)
+        #         forget_outputs_oracle = self.oracle_model(forget_input_ids, labels=forget_labels, attention_mask=forget_attention_mask)
+        #         idk_logits_oracle = idk_outputs_oracle.logits
+        #         forget_logits_oracle = forget_outputs_oracle.logits
+
+        #     idk_loss_oracle = -1 * get_batch_loss(idk_logits_oracle, idk_labels)  
+        #     forget_loss_oracle = -1 * get_batch_loss(forget_logits_oracle, labels)
+
+        #     idk_loss_current = -1 * get_batch_loss(idk_outputs.logits, idk_labels)
+        #     forget_loss_current = -1 * get_batch_loss(forget_outputs.logits, labels)
+
+        #     # Compute model's confidence scores
+        #     idk_confidence = torch.softmax(idk_outputs.logits, dim=-1).max(dim=-1)[0]
+        #     forget_confidence = torch.softmax(forget_outputs.logits, dim=-1).max(dim=-1)[0]
+
+        #     # Weight the loss ratios by the model's confidence
+        #     pi_logratios = (idk_loss_current * idk_confidence) - (forget_loss_current * forget_confidence)
+        #     ref_logratios = idk_loss_oracle - forget_loss_oracle  
+
+        #     beta = 0.1
+        #     loss = -F.logsigmoid(beta * (pi_logratios - ref_logratios)).mean()
+
+        #     outputs = forget_outputs
         
-        return (loss, outputs) if return_outputs else loss
+        # return (loss, outputs) if return_outputs else loss
+
+        # elif self.loss_type == "confidence_weighted_dpo":
+
         
     
     def prediction_step(self, model, inputs, prediction_loss_only: bool, ignore_keys=None):
